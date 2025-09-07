@@ -1,18 +1,3 @@
-# Towing Mock Backend API
-
-A comprehensive mock backend API for a towing service management system with real-time GPS tracking simulation. This API provides all the functionality needed to build a complete towing management frontend application.
-
-## Features
-
-- **Job Management**: Create, view, assign, and complete towing jobs
-- **Driver Management**: Manage active drivers with validation
-- **Vehicle Management**: Fleet vehicle tracking and management
-- **Real-time GPS Tracking**: WebSocket-based GPS simulation with 15-second updates
-- **Complete Job Lifecycle**: Assignment → En Route → Arrival → Return Journey → Completion
-- **Invoice & Payment System**: Track billing and payments
-- **Impound Management**: Handle impounded vehicles
-- **Mock Data**: Pre-seeded with 5 drivers, 5 vehicles, and 15 sample jobs
-
 ## Quick Start with Docker
 
 ### Prerequisites
@@ -25,6 +10,8 @@ docker build -t towing-mock-backend .
 
 # Run the container
 docker run -p 8080:8080 towing-mock-backend
+
+# A new database will be instantiated every time (as this is a MOCK api)!
 ```
 
 ### Docker Management
@@ -36,21 +23,6 @@ docker compose logs -f
 
 # With manual container (replace container-name)
 docker logs -f towing-mock-backend
-```
-
-**Stop the application:**
-```bash
-# With docker-compose
-docker compose down
-
-# With manual container
-docker stop towing-mock-backend
-```
-
-**Restart with fresh database:**
-```bash
-docker compose down
-docker compose up --build
 ```
 
 ## Complete API Documentation

@@ -84,13 +84,19 @@ func seedDatabase(db *sql.DB) {
 		pickup := locations[rand.Intn(len(locations))]
 		destination := locations[rand.Intn(len(locations))]
 		jobType := jobTypes[rand.Intn(len(jobTypes))]
-		status := statuses[rand.Intn(len(statuses))]
 		
-		// Random assignment (some jobs unassigned)
+		// Ensure first 5 jobs are pending for testing
+		var status string
 		var driverID, vehicleID interface{}
-		if rand.Float32() > 0.3 { // 70% chance of assignment
-			driverID = rand.Intn(5) + 1
-			vehicleID = rand.Intn(5) + 1
+		if i < 5 {
+			status = "pending"
+		} else {
+			status = statuses[rand.Intn(len(statuses))]
+			// Random assignment for non-pending jobs
+			if status != "pending" && rand.Float32() > 0.3 {
+				driverID = rand.Intn(5) + 1
+				vehicleID = rand.Intn(5) + 1
+			}
 		}
 
 		// Random completion time for completed jobs

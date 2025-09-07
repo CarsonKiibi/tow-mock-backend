@@ -5,15 +5,64 @@ import (
    "encoding/json"
    "fmt"
    "log"
+   "math"
+   "math/rand"
    "net/http"
-
    "os"
+   "strconv"
+   "sync"
+   "time"
 
    "github.com/gorilla/mux"
+   "github.com/gorilla/websocket"
    _ "github.com/mattn/go-sqlite3"
 )
 
 var db *sql.DB
+
+var upgrader = websocket.Upgrader{
+   CheckOrigin: func(r *http.Request) bool {
+   	return true
+   },
+}
+
+type GPSData struct {
+   JobID     int64   `json:"job_id"`
+   DriverID  int64   `json:"driver_id"`
+   Latitude  float64 `json:"latitude"`
+   Longitude float64 `json:"longitude"`
+   Timestamp string  `json:"timestamp"`
+   Status    string  `json:"status"`
+   Message   string  `json:"message,omitempty"`
+}
+
+type ActiveJob struct {
+   JobID       int64
+   DriverID    int64
+   StartLat    float64
+   StartLng    float64
+   EndLat      float64
+   EndLng      float64
+   CurrentLat  float64
+   CurrentLng  float64
+   StartTime   time.Time
+   Direction   int // 1 for going to job, -1 for returning
+   Completed   bool
+   Steps       []GPSCoordinate
+   CurrentStep int
+}
+
+type GPSCoordinate struct {
+   Lat float64
+   Lng float64
+}
+
+var (
+   activeJobs = make(map[int64]*ActiveJob)
+   activeMutex = sync.RWMutex{}
+   websocketClients = make(map[*websocket.Conn]bool)
+   clientsMutex = sync.RWMutex{}
+)
 
 func main() {
    if _, err := os.Stat("./database.db"); err == nil {
@@ -43,11 +92,15 @@ func main() {
    
    // Jobs endpoints
    r.HandleFunc("/jobs", getJobs).Methods("GET")
+   r.HandleFunc("/jobs/available", getAvailableJobs).Methods("GET")
    r.HandleFunc("/jobs", createJob).Methods("POST")
    r.HandleFunc("/jobs/{id}", getJob).Methods("GET")
    r.HandleFunc("/jobs/{id}", updateJob).Methods("PUT")
-   r.HandleFunc("/jobs/{id}/assign", assignJob).Methods("PUT")
+   r.HandleFunc("/jobs/{id}/assign", assignJobWithValidation).Methods("PUT")
    r.HandleFunc("/jobs/{id}/complete", completeJob).Methods("PUT")
+   
+   // GPS tracking websocket
+   r.HandleFunc("/ws/gps", handleGPSWebSocket).Methods("GET")
    
    // Drivers endpoints
    r.HandleFunc("/drivers", getDrivers).Methods("GET")
@@ -77,6 +130,9 @@ func main() {
    r.HandleFunc("/impound/{id}/release", releaseVehicle).Methods("PUT")
    r.HandleFunc("/impound/current", getCurrentlyImpounded).Methods("GET")
 
+   // Start GPS simulation goroutine
+   go gpsSimulationWorker()
+   
    // Apply CORS middleware
    handler := enableCORS(r)
    
@@ -229,25 +285,6 @@ func createJob(w http.ResponseWriter, r *http.Request) {
    json.NewEncoder(w).Encode(map[string]int64{"id": id})
 }
 
-func assignJob(w http.ResponseWriter, r *http.Request) {
-   vars := mux.Vars(r)
-   jobID := vars["id"]
-
-   var assignment map[string]interface{}
-   if err := json.NewDecoder(r.Body).Decode(&assignment); err != nil {
-   	http.Error(w, err.Error(), http.StatusBadRequest)
-   	return
-   }
-
-   _, err := db.Exec(`UPDATE jobs SET assigned_driver_id = ?, assigned_vehicle_id = ?, status = 'assigned' WHERE id = ?`,
-   	assignment["driver_id"], assignment["vehicle_id"], jobID)
-   if err != nil {
-   	http.Error(w, err.Error(), http.StatusInternalServerError)
-   	return
-   }
-
-   w.WriteHeader(http.StatusOK)
-}
 
 func completeJob(w http.ResponseWriter, r *http.Request) {
    vars := mux.Vars(r)
@@ -572,6 +609,371 @@ func updateInvoice(w http.ResponseWriter, r *http.Request) { /* implement invoic
 func getPendingInvoices(w http.ResponseWriter, r *http.Request) { /* implement pending invoices */ }
 func getPaymentsByInvoice(w http.ResponseWriter, r *http.Request) { /* implement payments by invoice */ }
 func getActiveVehicles(w http.ResponseWriter, r *http.Request) { /* implement active vehicles only */ }
+
+// Get available jobs (pending/unassigned)
+func getAvailableJobs(w http.ResponseWriter, r *http.Request) {
+   rows, err := db.Query(`SELECT id, vehicle_description, pickup_coordinates, destination_coordinates, 
+   	created_at, job_type, notes FROM jobs WHERE status = 'pending' LIMIT 5`)
+   if err != nil {
+   	http.Error(w, err.Error(), http.StatusInternalServerError)
+   	return
+   }
+   defer rows.Close()
+
+   var jobs []map[string]interface{}
+   for rows.Next() {
+   	var id sql.NullInt64
+   	var vehicleDesc, pickup, destination, jobType, notes sql.NullString
+   	var createdAt sql.NullString
+
+   	err := rows.Scan(&id, &vehicleDesc, &pickup, &destination, &createdAt, &jobType, &notes)
+   	if err != nil {
+   		http.Error(w, err.Error(), http.StatusInternalServerError)
+   		return
+   	}
+
+   	job := map[string]interface{}{
+   		"id": id.Int64,
+   		"vehicle_description": vehicleDesc.String,
+   		"pickup_coordinates": pickup.String,
+   		"destination_coordinates": destination.String,
+   		"created_at": createdAt.String,
+   		"job_type": jobType.String,
+   		"status": "pending",
+   		"notes": notes.String,
+   	}
+   	jobs = append(jobs, job)
+   }
+
+   w.Header().Set("Content-Type", "application/json")
+   json.NewEncoder(w).Encode(jobs)
+}
+
+// Assign job with validation
+func assignJobWithValidation(w http.ResponseWriter, r *http.Request) {
+   vars := mux.Vars(r)
+   jobIDStr := vars["id"]
+   jobID, err := strconv.ParseInt(jobIDStr, 10, 64)
+   if err != nil {
+   	http.Error(w, "Invalid job ID", http.StatusBadRequest)
+   	return
+   }
+
+   var assignment map[string]interface{}
+   if err := json.NewDecoder(r.Body).Decode(&assignment); err != nil {
+   	http.Error(w, err.Error(), http.StatusBadRequest)
+   	return
+   }
+
+   driverID, ok := assignment["driver_id"]
+   if !ok {
+   	http.Error(w, "driver_id is required", http.StatusBadRequest)
+   	return
+   }
+
+   // Verify job exists and is pending
+   var jobStatus string
+   err = db.QueryRow("SELECT status FROM jobs WHERE id = ?", jobID).Scan(&jobStatus)
+   if err == sql.ErrNoRows {
+   	http.Error(w, "Job not found", http.StatusNotFound)
+   	return
+   } else if err != nil {
+   	http.Error(w, err.Error(), http.StatusInternalServerError)
+   	return
+   }
+
+   if jobStatus != "pending" {
+   	http.Error(w, "Job is not available for assignment", http.StatusBadRequest)
+   	return
+   }
+
+   // Verify driver exists and is active
+   var isActive bool
+   err = db.QueryRow("SELECT is_active FROM drivers WHERE id = ?", driverID).Scan(&isActive)
+   if err == sql.ErrNoRows {
+   	http.Error(w, "Driver not found", http.StatusNotFound)
+   	return
+   } else if err != nil {
+   	http.Error(w, err.Error(), http.StatusInternalServerError)
+   	return
+   }
+
+   if !isActive {
+   	http.Error(w, "Driver is not active", http.StatusBadRequest)
+   	return
+   }
+
+   // Update job assignment
+   _, err = db.Exec(`UPDATE jobs SET assigned_driver_id = ?, status = 'assigned' WHERE id = ?`,
+   	driverID, jobID)
+   if err != nil {
+   	http.Error(w, err.Error(), http.StatusInternalServerError)
+   	return
+   }
+
+   // Start GPS simulation for this job
+   startGPSSimulation(jobID, driverID.(float64))
+
+   w.Header().Set("Content-Type", "application/json")
+   json.NewEncoder(w).Encode(map[string]string{"status": "assigned"})
+}
+
+// WebSocket handler for GPS tracking
+func handleGPSWebSocket(w http.ResponseWriter, r *http.Request) {
+   conn, err := upgrader.Upgrade(w, r, nil)
+   if err != nil {
+   	log.Printf("WebSocket upgrade failed: %v", err)
+   	return
+   }
+   defer conn.Close()
+
+   // Add client to active connections
+   clientsMutex.Lock()
+   websocketClients[conn] = true
+   clientsMutex.Unlock()
+
+   // Remove client when connection closes
+   defer func() {
+   	clientsMutex.Lock()
+   	delete(websocketClients, conn)
+   	clientsMutex.Unlock()
+   }()
+
+   // Keep connection alive
+   for {
+   	_, _, err := conn.ReadMessage()
+   	if err != nil {
+   		log.Printf("WebSocket read error: %v", err)
+   		break
+   	}
+   }
+}
+
+// Start GPS simulation for a job
+func startGPSSimulation(jobID int64, driverIDFloat float64) {
+   driverID := int64(driverIDFloat)
+   
+   // Get job coordinates
+   var pickup, destination string
+   err := db.QueryRow("SELECT pickup_coordinates, destination_coordinates FROM jobs WHERE id = ?", jobID).Scan(&pickup, &destination)
+   if err != nil {
+   	log.Printf("Error getting job coordinates: %v", err)
+   	return
+   }
+
+   // Parse coordinates (assuming format like "lat,lng")
+   startLat, startLng := parseCoordinates(pickup)
+   endLat, endLng := parseCoordinates(destination)
+
+   // Create active job
+   activeJob := &ActiveJob{
+   	JobID:       jobID,
+   	DriverID:    driverID,
+   	StartLat:    startLat,
+   	StartLng:    startLng,
+   	EndLat:      endLat,
+   	EndLng:      endLng,
+   	CurrentLat:  startLat,
+   	CurrentLng:  startLng,
+   	StartTime:   time.Now(),
+   	Direction:   1,
+   	Completed:   false,
+   	CurrentStep: 0,
+   }
+
+   // Generate GPS route steps
+   activeJob.Steps = generateRoute(startLat, startLng, endLat, endLng)
+
+   // Add to active jobs
+   activeMutex.Lock()
+   activeJobs[jobID] = activeJob
+   activeMutex.Unlock()
+
+   log.Printf("Started GPS simulation for job %d with driver %d", jobID, driverID)
+}
+
+// Parse coordinates from string format
+func parseCoordinates(coords string) (float64, float64) {
+   // For simplicity, using mock coordinates
+   // In real implementation, would parse the actual coordinate string
+   return 40.7128 + rand.Float64()*0.1 - 0.05, -74.0060 + rand.Float64()*0.1 - 0.05
+}
+
+// Generate route between two points
+func generateRoute(startLat, startLng, endLat, endLng float64) []GPSCoordinate {
+   steps := make([]GPSCoordinate, 0)
+   
+   // Calculate distance and number of steps
+   distance := calculateDistance(startLat, startLng, endLat, endLng)
+   numSteps := int(distance / 0.0005) // Approximately 100-300 meters per step
+   
+   if numSteps < 8 {
+   	numSteps = 8 // Minimum steps for 2 minutes journey
+   }
+   if numSteps > 20 {
+   	numSteps = 20 // Maximum steps for 5 minutes journey
+   }
+
+   // Generate intermediate points
+   for i := 0; i <= numSteps; i++ {
+   	progress := float64(i) / float64(numSteps)
+   	lat := startLat + (endLat-startLat)*progress
+   	lng := startLng + (endLng-startLng)*progress
+   	
+   	// Add some random variation to make it more realistic
+   	lat += (rand.Float64() - 0.5) * 0.001
+   	lng += (rand.Float64() - 0.5) * 0.001
+   	
+   	steps = append(steps, GPSCoordinate{Lat: lat, Lng: lng})
+   }
+
+   return steps
+}
+
+// Calculate distance between two coordinates (Haversine formula)
+func calculateDistance(lat1, lng1, lat2, lng2 float64) float64 {
+   const R = 6371 // Earth's radius in kilometers
+   
+   dLat := (lat2 - lat1) * math.Pi / 180
+   dLng := (lng2 - lng1) * math.Pi / 180
+   
+   a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(lat1*math.Pi/180)*math.Cos(lat2*math.Pi/180)*math.Sin(dLng/2)*math.Sin(dLng/2)
+   c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+   
+   return R * c
+}
+
+// GPS simulation worker
+func gpsSimulationWorker() {
+   ticker := time.NewTicker(15 * time.Second)
+   defer ticker.Stop()
+
+   log.Println("GPS simulation worker started")
+
+   for {
+   	select {
+   	case <-ticker.C:
+   		processActiveJobs()
+   	}
+   }
+}
+
+// Process all active jobs
+func processActiveJobs() {
+   activeMutex.Lock()
+   defer activeMutex.Unlock()
+
+   for jobID, activeJob := range activeJobs {
+   	if activeJob.Completed {
+   		continue
+   	}
+
+   	// Update GPS position
+   	updateJobGPS(activeJob)
+
+   	// Check if job should be completed
+   	if activeJob.Direction == 1 && activeJob.CurrentStep >= len(activeJob.Steps)-1 {
+   		// Driver has arrived at job location
+   		broadcastGPSData(GPSData{
+   			JobID:     activeJob.JobID,
+   			DriverID:  activeJob.DriverID,
+   			Latitude:  activeJob.CurrentLat,
+   			Longitude: activeJob.CurrentLng,
+   			Timestamp: time.Now().Format(time.RFC3339),
+   			Status:    "arrived",
+   			Message:   "Driver has arrived at the job location",
+   		})
+   		
+   		// Start return journey
+   		activeJob.Direction = -1
+   		activeJob.CurrentStep = len(activeJob.Steps) - 1
+   		
+   	} else if activeJob.Direction == -1 && activeJob.CurrentStep <= 0 {
+   		// Driver has completed the job
+   		broadcastGPSData(GPSData{
+   			JobID:     activeJob.JobID,
+   			DriverID:  activeJob.DriverID,
+   			Latitude:  activeJob.CurrentLat,
+   			Longitude: activeJob.CurrentLng,
+   			Timestamp: time.Now().Format(time.RFC3339),
+   			Status:    "completed",
+   			Message:   "Job completed successfully",
+   		})
+   		
+   		// Mark job as completed in database
+   		db.Exec("UPDATE jobs SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?", activeJob.JobID)
+   		
+   		activeJob.Completed = true
+   		delete(activeJobs, jobID)
+   		
+   	} else {
+   		// Send regular GPS update during normal driving
+   		broadcastGPSData(GPSData{
+   			JobID:     activeJob.JobID,
+   			DriverID:  activeJob.DriverID,
+   			Latitude:  activeJob.CurrentLat,
+   			Longitude: activeJob.CurrentLng,
+   			Timestamp: time.Now().Format(time.RFC3339),
+   			Status:    getJobStatus(activeJob),
+   		})
+   	}
+   }
+}
+
+// Update GPS position for active job
+func updateJobGPS(activeJob *ActiveJob) {
+   if len(activeJob.Steps) == 0 {
+   	return
+   }
+
+   // Move to next step
+   if activeJob.Direction == 1 && activeJob.CurrentStep < len(activeJob.Steps)-1 {
+   	activeJob.CurrentStep++
+   } else if activeJob.Direction == -1 && activeJob.CurrentStep > 0 {
+   	activeJob.CurrentStep--
+   }
+
+   // Update current position
+   if activeJob.CurrentStep >= 0 && activeJob.CurrentStep < len(activeJob.Steps) {
+   	step := activeJob.Steps[activeJob.CurrentStep]
+   	activeJob.CurrentLat = step.Lat
+   	activeJob.CurrentLng = step.Lng
+   }
+}
+
+// Get job status based on direction and progress
+func getJobStatus(activeJob *ActiveJob) string {
+   if activeJob.Direction == 1 {
+   	return "en_route_to_job"
+   }
+   return "returning_to_base"
+}
+
+// Broadcast GPS data to all connected WebSocket clients
+func broadcastGPSData(gpsData GPSData) {
+   clientsMutex.RLock()
+   defer clientsMutex.RUnlock()
+
+   for conn := range websocketClients {
+   	err := conn.WriteJSON(gpsData)
+   	if err != nil {
+   		log.Printf("Error broadcasting GPS data: %v", err)
+   		conn.Close()
+   		delete(websocketClients, conn)
+   	}
+   }
+   
+   // Get driver name and license for logging
+   var driverName, licenseNumber string
+   err := db.QueryRow("SELECT name, license_number FROM drivers WHERE id = ?", gpsData.DriverID).Scan(&driverName, &licenseNumber)
+   if err != nil {
+   	driverName = "Unknown"
+   	licenseNumber = "Unknown"
+   }
+   
+   log.Printf("GPS data for job %d (%s - %s): %s at %.6f,%.6f", 
+   	gpsData.JobID, driverName, licenseNumber, gpsData.Status, gpsData.Latitude, gpsData.Longitude)
+}
 
 func enableCORS(next http.Handler) http.Handler {
    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

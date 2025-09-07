@@ -1,0 +1,21 @@
+# Binaries
+towing-server
+*.exe
+
+# Database files
+*.db
+
+# Git
+.git
+.gitignore
+
+# IDE files
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

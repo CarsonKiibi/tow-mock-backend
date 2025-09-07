@@ -1,0 +1,11 @@
+services:
+  towing-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    container_name: towing-mock-backend
+    environment:
+      - GO_ENV=production

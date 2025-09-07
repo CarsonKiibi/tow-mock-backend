@@ -49,6 +49,7 @@ type ActiveJob struct {
    Direction   int // 1 for going to job, -1 for returning
    Completed   bool
    Steps       []GPSCoordinate
+   ReturnSteps []GPSCoordinate // Exact reverse of outbound journey
    CurrentStep int
 }
 
@@ -783,6 +784,12 @@ func startGPSSimulation(jobID int64, driverIDFloat float64) {
 
    // Generate GPS route steps
    activeJob.Steps = generateRoute(startLat, startLng, endLat, endLng)
+   
+   // Create return steps as exact reverse of outbound journey
+   activeJob.ReturnSteps = make([]GPSCoordinate, len(activeJob.Steps))
+   for i, step := range activeJob.Steps {
+   	activeJob.ReturnSteps[len(activeJob.Steps)-1-i] = step
+   }
 
    // Add to active jobs
    activeMutex.Lock()
@@ -884,11 +891,11 @@ func processActiveJobs() {
    			Message:   "Driver has arrived at the job location",
    		})
    		
-   		// Start return journey
+   		// Start return journey - reset step counter for return steps
    		activeJob.Direction = -1
-   		activeJob.CurrentStep = len(activeJob.Steps) - 1
+   		activeJob.CurrentStep = 0
    		
-   	} else if activeJob.Direction == -1 && activeJob.CurrentStep <= 0 {
+   	} else if activeJob.Direction == -1 && activeJob.CurrentStep >= len(activeJob.ReturnSteps)-1 {
    		// Driver has completed the job
    		broadcastGPSData(GPSData{
    			JobID:     activeJob.JobID,
@@ -926,19 +933,29 @@ func updateJobGPS(activeJob *ActiveJob) {
    	return
    }
 
-   // Move to next step
+   // Move to next step based on direction
    if activeJob.Direction == 1 && activeJob.CurrentStep < len(activeJob.Steps)-1 {
    	activeJob.CurrentStep++
-   } else if activeJob.Direction == -1 && activeJob.CurrentStep > 0 {
-   	activeJob.CurrentStep--
+   } else if activeJob.Direction == -1 && activeJob.CurrentStep < len(activeJob.ReturnSteps)-1 {
+   	activeJob.CurrentStep++
    }
 
-   // Update current position
-   if activeJob.CurrentStep >= 0 && activeJob.CurrentStep < len(activeJob.Steps) {
-   	step := activeJob.Steps[activeJob.CurrentStep]
-   	activeJob.CurrentLat = step.Lat
-   	activeJob.CurrentLng = step.Lng
+   // Update current position using appropriate steps array
+   var step GPSCoordinate
+   if activeJob.Direction == 1 {
+   	// Outbound journey - use Steps
+   	if activeJob.CurrentStep >= 0 && activeJob.CurrentStep < len(activeJob.Steps) {
+   		step = activeJob.Steps[activeJob.CurrentStep]
+   	}
+   } else {
+   	// Return journey - use ReturnSteps (which are already reversed)
+   	if activeJob.CurrentStep >= 0 && activeJob.CurrentStep < len(activeJob.ReturnSteps) {
+   		step = activeJob.ReturnSteps[activeJob.CurrentStep]
+   	}
    }
+   
+   activeJob.CurrentLat = step.Lat
+   activeJob.CurrentLng = step.Lng
 }
 
 // Get job status based on direction and progress

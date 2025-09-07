@@ -796,7 +796,7 @@ func startGPSSimulation(jobID int64, driverIDFloat float64) {
 func parseCoordinates(coords string) (float64, float64) {
    // For simplicity, using mock coordinates
    // In real implementation, would parse the actual coordinate string
-   return 40.7128 + rand.Float64()*0.1 - 0.05, -74.0060 + rand.Float64()*0.1 - 0.05
+   return 49.269391 + rand.Float64()*0.1 - 0.05, -123.095063 + rand.Float64()*0.1 - 0.05
 }
 
 // Generate route between two points
@@ -807,11 +807,11 @@ func generateRoute(startLat, startLng, endLat, endLng float64) []GPSCoordinate {
    distance := calculateDistance(startLat, startLng, endLat, endLng)
    numSteps := int(distance / 0.0005) // Approximately 100-300 meters per step
    
-   if numSteps < 8 {
-   	numSteps = 8 // Minimum steps for 2 minutes journey
+   if numSteps < 4 {
+   	numSteps = 4 // 1 min
    }
-   if numSteps > 20 {
-   	numSteps = 20 // Maximum steps for 5 minutes journey
+   if numSteps > 8 {
+   	numSteps = 8 // 2 min
    }
 
    // Generate intermediate points
